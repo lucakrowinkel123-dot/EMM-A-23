@@ -20,6 +20,9 @@
 //                Sends PathClear to the miner after saving.
 // LoadAsteroid <n> : load the path records from the saved Asteroid record <n> (e.g. 002)
 //                    into the miner's "EMM-A Mi Path" timer, replacing its current content.
+// GoTo Asteroid <n> : safe approach to saved asteroid parking position.
+//                     Picks a clear 1000 m waypoint (front or rear), flies to it,
+//                     then approaches along that axis to align at the saved carrier pose.
 // =====================================
 
 // ========== Editable Script Settings ==========
@@ -65,6 +68,13 @@ bool pathPaused          = false;
 bool pathPausedNavResume = false;
 List<string> pathRecords = new List<string>();
 int pathIndex            = 0;
+
+enum GoToPhase { None, ToWaypoint, ToFinal }
+GoToPhase goToPhase        = GoToPhase.None;
+Vector3D  goToFinalPos     = Vector3D.Zero;
+Vector3D  goToFinalForward = Vector3D.Zero;
+Vector3D  goToFinalUp      = Vector3D.Zero;
+string    goToLabel        = "";
 
 double secondsPerTick  = 1.0 / 60.0;
 readonly int echoFrequency = 100;
@@ -124,6 +134,7 @@ public void Main(string argument, UpdateType updateSource)
             ResetMovement();
 
         UpdatePathRunner();
+        UpdateGoTo();
         runtime++;
     }
     else
@@ -167,6 +178,8 @@ void WriteEcho()
     sb.AppendLine($"TOFF R/U/F: {TOFFR:0.00}/{TOFFU:0.00}/{TOFFF:0.00} m");
     if (pathMode)
         sb.AppendLine($"Path: {Math.Min(pathIndex + 1, pathRecords.Count)}/{pathRecords.Count}" + (pathPaused ? " (paused)" : ""));
+    if (goToPhase != GoToPhase.None)
+        sb.AppendLine($"GoTo: Asteroid {goToLabel} [{goToPhase}]");
     sb.AppendLine($"Connector: {(carrierConnector != null ? carrierConnector.CustomName : "<missing>")}");
     sb.AppendLine("Dock broadcast: " + dockBroadcastTag);
     Echo(sb.ToString());
@@ -279,6 +292,12 @@ void RemoteCommand(string command)
         return;
     }
 
+    if (trimmed.StartsWith("GoTo ", StringComparison.OrdinalIgnoreCase))
+    {
+        ExecuteGoTo(trimmed.Substring(5).Trim());
+        return;
+    }
+
     switch (trimmed.ToLower())
     {
         case "stop":
@@ -302,6 +321,8 @@ void RemoteCommand(string command)
             pathRecords.Clear();
             pathIndex           = 0;
             activeMaxSpeed      = 0;
+            goToPhase           = GoToPhase.None;
+            goToLabel           = "";
             ResetMovement();
             WriteEcho();
             break;
@@ -920,6 +941,11 @@ void SaveState()
     sb.AppendLine("pathCount="          + pathRecords.Count);
     for (int i = 0; i < pathRecords.Count; i++)
         sb.AppendLine("pathRecord" + i + "=" + pathRecords[i]);
+    sb.AppendLine("goToPhase="        + (int)goToPhase);
+    sb.AppendLine("goToLabel="        + goToLabel);
+    sb.AppendLine("goToFinalPos="     + V3ToString(goToFinalPos));
+    sb.AppendLine("goToFinalForward=" + V3ToString(goToFinalForward));
+    sb.AppendLine("goToFinalUp="      + V3ToString(goToFinalUp));
     Storage = sb.ToString();
 }
 
@@ -961,6 +987,139 @@ void LoadState()
             if (dict.TryGetValue("pathRecord" + i, out s))
                 pathRecords.Add(s);
         }
+    }
+
+    if (dict.TryGetValue("goToPhase",        out s) && int.TryParse(s, out n)) goToPhase = (GoToPhase)n;
+    if (dict.TryGetValue("goToLabel",         out s)) goToLabel = s;
+    if (dict.TryGetValue("goToFinalPos",      out s) && TryParseV3(s, out v)) goToFinalPos     = v;
+    if (dict.TryGetValue("goToFinalForward",  out s) && TryParseV3(s, out v)) goToFinalForward = v;
+    if (dict.TryGetValue("goToFinalUp",       out s) && TryParseV3(s, out v)) goToFinalUp      = v;
+}
+
+// ---- GoTo helpers ----
+
+bool LineSegmentIntersectsSphere(Vector3D a, Vector3D b, Vector3D c, double r)
+{
+    Vector3D d  = b - a;
+    Vector3D f  = a - c;
+    double qa   = Vector3D.Dot(d, d);
+    double qb   = 2.0 * Vector3D.Dot(f, d);
+    double qc   = Vector3D.Dot(f, f) - r * r;
+    double disc = qb * qb - 4.0 * qa * qc;
+    if (disc < 0) return false;
+    double sq = Math.Sqrt(disc);
+    double t1 = (-qb - sq) / (2.0 * qa);
+    double t2 = (-qb + sq) / (2.0 * qa);
+    return (t1 >= 0 && t1 <= 1) || (t2 >= 0 && t2 <= 1);
+}
+
+bool TryGetAsteroidCarrierGps(int asteroidNum, out Vector3D pos, out Vector3D fwd, out Vector3D up)
+{
+    pos = fwd = up = Vector3D.Zero;
+    int dbIndex    = (asteroidNum - 1) / asteroidsPerDb + 1;
+    string dbName  = asteroidDbTagPfx + dbIndex.ToString("D2");
+    IMyTimerBlock db = FindTimerByTag(dbName);
+    if (db == null) { Echo($"GoTo: timer '{dbName}' not found."); return false; }
+
+    string label   = asteroidNum.ToString("D3");
+    string[] lines = (db.CustomData ?? "").Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+    int state = 0;
+    foreach (string rawLine in lines)
+    {
+        string line = rawLine.Trim();
+        if (string.IsNullOrWhiteSpace(line)) continue;
+        if (state == 0)
+        {
+            if (string.Equals(line, "Asteroid " + label, StringComparison.OrdinalIgnoreCase))
+                state = 1;
+        }
+        else if (state == 1)
+        {
+            if (line == asteroidHeaderLine) break;
+            if (string.Equals(line, "Carrier pos:", StringComparison.OrdinalIgnoreCase))
+                state = 2;
+        }
+        else
+        {
+            if (!TryParseGpsCommand(line, out pos, out fwd, out up))
+            { Echo($"GoTo: bad GPS for Asteroid {label}: '{line}'"); return false; }
+            return true;
+        }
+    }
+    Echo($"GoTo: no carrier GPS for Asteroid {label} in '{dbName}'.");
+    return false;
+}
+
+void ExecuteGoTo(string argument)
+{
+    if (!argument.StartsWith("Asteroid ", StringComparison.OrdinalIgnoreCase))
+    { Echo("GoTo: usage: GoTo Asteroid NNN"); return; }
+
+    int num;
+    if (!int.TryParse(argument.Substring(9).Trim(), out num) || num < 1)
+    { Echo("GoTo: invalid asteroid number."); return; }
+
+    Vector3D savedPos, savedFwd, savedUp;
+    if (!TryGetAsteroidCarrierGps(num, out savedPos, out savedFwd, out savedUp)) return;
+
+    Vector3D bubbleCenter  = savedPos - savedUp * 500.0;
+    const double bubbleRadius = 750.0;
+    Vector3D p1 = savedPos + savedFwd * 1000.0;
+    Vector3D p2 = savedPos - savedFwd * 1000.0;
+    Vector3D now = rc.GetPosition();
+
+    bool p1Blocked = LineSegmentIntersectsSphere(now, p1, bubbleCenter, bubbleRadius);
+    bool p2Blocked = LineSegmentIntersectsSphere(now, p2, bubbleCenter, bubbleRadius);
+
+    Vector3D waypoint = (p1Blocked && !p2Blocked) ? p2 : p1;
+    string side = (p1Blocked && !p2Blocked) ? "behind (point2)" : "ahead (point1)";
+    Echo($"GoTo Asteroid {num:D3}: going {side}. p1blocked={p1Blocked} p2blocked={p2Blocked}");
+
+    pathMode            = false;
+    pathPaused          = false;
+    pathPausedNavResume = false;
+    pathRecords.Clear();
+    pathIndex           = 0;
+
+    goToLabel        = num.ToString("D3");
+    goToFinalPos     = savedPos;
+    goToFinalForward = savedFwd;
+    goToFinalUp      = savedUp;
+
+    targetPosition   = waypoint;
+    desiredForward   = Vector3D.Zero;
+    desiredUp        = Vector3D.Zero;
+    hasTarget        = true;
+    autopilotEnabled = true;
+    goToPhase        = GoToPhase.ToWaypoint;
+    activeMaxSpeed   = maxSpeed;
+    WriteEcho();
+}
+
+void UpdateGoTo()
+{
+    if (goToPhase == GoToPhase.None) return;
+
+    if (goToPhase == GoToPhase.ToWaypoint)
+    {
+        if (!IsAtTargetPosition(targetPosition)) return;
+        targetPosition   = goToFinalPos;
+        desiredForward   = goToFinalForward;
+        desiredUp        = goToFinalUp;
+        hasTarget        = true;
+        autopilotEnabled = true;
+        goToPhase        = GoToPhase.ToFinal;
+        Echo($"GoTo Asteroid {goToLabel}: waypoint reached, navigating to final position.");
+        return;
+    }
+
+    if (goToPhase == GoToPhase.ToFinal)
+    {
+        if (!IsAtTargetPose(goToFinalPos, goToFinalForward, goToFinalUp)) return;
+        goToPhase        = GoToPhase.None;
+        autopilotEnabled = false;
+        hasTarget        = false;
+        Echo($"GoTo Asteroid {goToLabel}: arrived.");
     }
 }
 
